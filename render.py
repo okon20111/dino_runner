@@ -67,14 +67,19 @@ class SpawnSpec:
 
 class ObstacleManager:
     # --- bezpieczniki układania (fix na ogromne odstępy na starcie poziomu) ---
-    START_FIRST_SPAWN_MIN_MS = 420
-    START_FIRST_SPAWN_MAX_MS = 700
+    START_FIRST_SPAWN_MIN_MS = 300
+    START_FIRST_SPAWN_MAX_MS = 520
 
     # anti-catchup: maksymalny horyzont liczenia (sekundy)
     CATCHUP_HORIZON_S = 1.25
 
     # maksymalny gap (żeby nigdy nie było „pustyni” na pół ekranu)
     MAX_GAP_FRAC_OF_SCREEN = 0.34
+    EXTRA_GAP_FRAC = 0.22
+    # Per level difficulty bump (background change).
+    LEVEL_DIFFICULTY_BONUS_STEP = 0.09
+    LEVEL_DIFFICULTY_BONUS_CAP = 0.40
+    MAX_DIFFICULTY = 1.35
 
     def __init__(
         self,
@@ -94,6 +99,14 @@ class ObstacleManager:
 
         # Powiększ przeszkody trochę bardziej
         self.obstacle_scale = 1.16
+        # Per-obstacle scale tweaks (filename -> multiplier).
+        self.obstacle_scale_overrides = {
+            "bg3_obs1.png": 1.10,
+            "bg4_obs1.png": 1.15,
+            "bg5_obs1.png": 1.20,
+            "bg6_obs1.png": 1.25,
+        }
+        self.raw_paths: Dict[int, List[str]] = {}
 
         self.rng = random.Random(seed)
         self.alpha_thr = int(mask_alpha_threshold)
@@ -110,6 +123,7 @@ class ObstacleManager:
 
         self.elapsed_ms = 0
         self.difficulty = 0.0
+        self.level_bonus = 0.0
         self.next_spawn_ms = 0
         self.pattern_cooldown_ms = 0
         self.last_pattern_name = ""
@@ -249,17 +263,22 @@ class ObstacleManager:
     # ---------- loading ----------
     def _load_raw_bank(self) -> Dict[int, List[pygame.Surface]]:
         bank: Dict[int, List[pygame.Surface]] = {}
+        path_bank: Dict[int, List[str]] = {}
         for i in range(6):
             pat = os.path.join(self.obstacle_dir, f"bg{i+1}_*.png")
             paths = sorted(glob.glob(pat))
             imgs: List[pygame.Surface] = []
+            ok_paths: List[str] = []
             for p in paths:
                 try:
                     raw = pygame.image.load(p).convert_alpha()
                     imgs.append(raw)
+                    ok_paths.append(p)
                 except Exception:
                     pass
             bank[i] = imgs
+            path_bank[i] = ok_paths
+        self.raw_paths = path_bank
         return bank
 
     def _build_base_bank(self) -> Dict[int, List[pygame.Surface]]:
@@ -303,8 +322,8 @@ class ObstacleManager:
         bounds = self._union_rects(rects, img.get_rect())
         foot_bottom = int(bounds.bottom)
 
-        ground_shadow_img, ground_shadow_offset = self._build_ground_shadow(img, bounds, foot_bottom)
-        soft_shadow_img, soft_shadow_offset = self._build_soft_shadow(img, mask)
+        ground_shadow_img, ground_shadow_offset = None, (0, 0)
+        soft_shadow_img, soft_shadow_offset = None, (0, 0)
         rim_img = self._build_rim(img, mask)
         highlight_img, highlight_offset = self._build_highlight(img, mask)
 
@@ -327,7 +346,9 @@ class ObstacleManager:
     # ---------- difficulty / speed ----------
     def _update_difficulty(self, dt_ms: int):
         self.elapsed_ms += max(0, int(dt_ms))
-        self.difficulty = min(1.0, self.elapsed_ms / 50000.0)
+        base = min(1.0, self.elapsed_ms / 50000.0)
+        bonus = min(self.LEVEL_DIFFICULTY_BONUS_CAP, self.level_bonus)
+        self.difficulty = min(self.MAX_DIFFICULTY, base + bonus)
 
     def _speed_now(self) -> float:
         return self.base_speed * (1.0 + 0.20 * self.difficulty)
@@ -399,6 +420,13 @@ class ObstacleManager:
         target = max(int(base_h * 0.84), min(int(base_h * 1.18), int(target)))
         return int(target)
 
+    def _obstacle_scale_for(self, bg_idx: int, img_idx: int) -> float:
+        paths = self.raw_paths.get(bg_idx, [])
+        if 0 <= int(img_idx) < len(paths):
+            name = os.path.basename(paths[int(img_idx)]).lower()
+            return float(self.obstacle_scale_overrides.get(name, 1.0))
+        return 1.0
+
     def _pick_pattern(self) -> Tuple[str, List[SpawnSpec]]:
         if self.pattern_cooldown_ms > 0:
             return "single", [SpawnSpec()]
@@ -464,6 +492,7 @@ class ObstacleManager:
         self.obstacles.clear()
         self.elapsed_ms = 0
         self.difficulty = 0.0
+        self.level_bonus = 0.0
         self.recent_img_idx.clear()
         self.pattern_cooldown_ms = 0
         self.last_pattern_name = ""
@@ -490,6 +519,11 @@ class ObstacleManager:
         # mały cooldown żeby nie robić triple od razu po zmianie tła
         self.pattern_cooldown_ms = min(self.pattern_cooldown_ms, 450)
         self.last_pattern_name = ""
+        self.level_bonus = min(
+            self.LEVEL_DIFFICULTY_BONUS_CAP,
+            self.level_bonus + self.LEVEL_DIFFICULTY_BONUS_STEP,
+        )
+        self._update_difficulty(0)
 
         self._spawn_one(
             baseline_y=0,
@@ -655,7 +689,7 @@ class ObstacleManager:
     # ---------- internal spawn ----------
     def _initial_visible_x(self, dino_safe_right_px: int) -> int:
         # start bliżej (mniej pustego ekranu), ale nadal bezpiecznie dla dino
-        x = int(self.sw * self.rng.uniform(0.58, 0.74))
+        x = int(self.sw * self.rng.uniform(0.50, 0.66))
         min_x = dino_safe_right_px + int(self.sw * 0.26)
         return max(x, min_x)
 
@@ -680,6 +714,9 @@ class ObstacleManager:
         img_idx = max(0, min(img_idx, len(raws) - 1))
 
         target_h = self._pick_variant_h(size_bias=size_bias)
+        scale_mult = self._obstacle_scale_for(self.bg_idx, img_idx)
+        if scale_mult != 1.0:
+            target_h = max(8, int(target_h * scale_mult))
         v = self._get_variant(self.bg_idx, img_idx, target_h)
 
         if start_baseline_override:
@@ -696,7 +733,8 @@ class ObstacleManager:
         if start_x is not None:
             x = float(start_x)
         else:
-            x = float(self.sw + self.rng.randint(60, int(self.sw * 0.20)))
+            pad_hi = max(36, int(self.sw * 0.12))
+            x = float(self.sw + self.rng.randint(24, pad_hi))
 
         if self.obstacles:
             # po sortowaniu w update - ostatni = najbardziej na prawo
@@ -718,12 +756,16 @@ class ObstacleManager:
                 gap = max(gap, 32 + int(catchup))
 
             # twardy limit gapu
-            max_gap = int(self.sw * self.MAX_GAP_FRAC_OF_SCREEN) + int(self.dino_h * 0.45)
-            gap = min(gap, max_gap)
+            max_gap_cap = int(self.sw * self.MAX_GAP_FRAC_OF_SCREEN) + int(self.dino_h * 0.45)
+            gap = min(gap, max_gap_cap)
+            max_gap = min(max_gap_cap, gap + int(gap * self.EXTRA_GAP_FRAC))
 
             min_x = float(last.draw_rect.right + gap)
+            max_x = float(last.draw_rect.right + max_gap)
             if x < min_x:
                 x = min_x
+            elif x > max_x:
+                x = max_x
 
         if start_x is None:
             min_x_from_dino = float(dino_safe_right_px + int(self.sw * 0.26))

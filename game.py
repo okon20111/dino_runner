@@ -39,11 +39,15 @@ FADE_MENU_TO_LOAD_MS = 900
 LOAD_DURATION_MS = 4000
 FADE_LOAD_TO_BG_MS = 900
 FADE_BG_TO_MENU_MS = 700  # po kolizji
+FADE_BG_TO_COUNTDOWN_MS = 700
+
+COUNTDOWN_DURATION_MS = 3000
+COUNTDOWN_SECONDS = max(1, COUNTDOWN_DURATION_MS // 1000)
 
 FADE_MENU_TO_SETTINGS_MS = 650
 FADE_SETTINGS_TO_MENU_MS = 450
 
-TARGET_FPS_NO_VSYNC = 60
+TARGET_FPS_NO_VSYNC = 90
 
 # =====================
 # WŁASNY KURSOR (skalowany)
@@ -68,10 +72,11 @@ MAX_DT_MS_FOR_SCROLL = 40
 
 # =====================
 # LEVEL SPEED
+# Speed per level: +15%, cap 2.50x.
 # =====================
 # Co level (czyli co zmianę tła) przyspieszamy o +4.2%, max do 1.40x.
-LEVEL_SPEED_INCREASE = 0.042
-LEVEL_SPEED_CAP_MULT = 1.40
+LEVEL_SPEED_INCREASE = 0.15
+LEVEL_SPEED_CAP_MULT = 2.50
 
 # =====================
 # DINO - PARAMETRY
@@ -130,6 +135,9 @@ jump_sound_enabled = True
 # wartości: "space", "up", "w"
 jump_key_mode = "space"
 
+# >>> USTAWIENIA: odliczanie do nastepnego tla (domyslnie WL.)
+bg_timer_enabled = True
+
 def current_jump_key() -> int:
     if jump_key_mode == "up":
         return pygame.K_UP
@@ -162,7 +170,7 @@ def _get_settings_path():
     return folder, path
 
 def load_user_settings():
-    global jump_sound_enabled, jump_key_mode
+    global jump_sound_enabled, jump_key_mode, bg_timer_enabled
     folder, path = _get_settings_path()
     try:
         os.makedirs(folder, exist_ok=True)
@@ -176,6 +184,9 @@ def load_user_settings():
         if isinstance(data, dict):
             if "jump_sound_enabled" in data:
                 jump_sound_enabled = bool(data["jump_sound_enabled"])
+
+            if "bg_timer_enabled" in data:
+                bg_timer_enabled = bool(data["bg_timer_enabled"])
 
             if "jump_key" in data:
                 v = str(data["jump_key"]).lower().strip()
@@ -197,6 +208,7 @@ def save_user_settings():
 
     data = {
         "jump_sound_enabled": bool(jump_sound_enabled),
+        "bg_timer_enabled": bool(bg_timer_enabled),
         "jump_key": str(jump_key_mode),
     }
 
@@ -230,6 +242,26 @@ MENU_MAX_WIDTH_FRAC = 0.72
 MENU_MAX_HEIGHT_FRAC = 0.68
 MENU_Y_OFFSET_FRAC = 0.01
 MENU_SPACING_FRAC = 0.26
+
+# =====================
+# HUD / PAUSE / GAME OVER
+# =====================
+HUD_MARGIN_FRAC = 0.02
+PAUSE_BTN_RADIUS_FRAC = 0.035
+
+PAUSE_BTN_FILL = (30, 30, 30)
+PAUSE_BTN_FILL_HOVER = (45, 45, 45)
+PAUSE_BTN_ICON = (245, 245, 245)
+PAUSE_BTN_OUTLINE = (210, 210, 210)
+
+OVERLAY_DIM_ALPHA = 140
+OVERLAY_TITLE_Y_FRAC = 0.30
+OVERLAY_OPTIONS_GAP_FRAC = 0.06
+OVERLAY_OPTIONS_SPACING_FRAC = 0.28
+OVERLAY_OPTIONS_MAX_WIDTH_FRAC = 0.82
+OVERLAY_OPTIONS_MAX_HEIGHT_FRAC = 0.26
+OVERLAY_OPTION_START_SIZE_FRAC = 0.07
+OVERLAY_OPTION_MIN_SIZE_PX = 22
 
 # =====================
 # USTAWIENIA: design (piękny "glass" UI)
@@ -347,6 +379,184 @@ def render_text_styled(font: pygame.font.Font, text: str,
 
     out.blit(base, (outline_px, outline_px))
     return out
+
+# =====================
+# HUD / Pause / Game over helpers
+# =====================
+def _build_option_surfaces(labels, font_size: int):
+    font = pygame.font.Font(FONT_PATH, font_size)
+    surfs_normal = [
+        render_text_styled(
+            font, txt,
+            fill=MENU_TEXT_FILL,
+            outline=MENU_TEXT_OUTLINE,
+            outline_px=MENU_OUTLINE_PX,
+            shadow=MENU_TEXT_SHADOW,
+            shadow_offset=MENU_SHADOW_OFFSET
+        )
+        for txt in labels
+    ]
+    surfs_hover = [
+        render_text_styled(
+            font, txt,
+            fill=MENU_HOVER_FILL,
+            outline=MENU_HOVER_OUTLINE,
+            outline_px=MENU_OUTLINE_PX,
+            shadow=MENU_HOVER_SHADOW,
+            shadow_offset=MENU_SHADOW_OFFSET
+        )
+        for txt in labels
+    ]
+
+    spacing = int(font_size * OVERLAY_OPTIONS_SPACING_FRAC)
+    total_h = sum(s.get_height() for s in surfs_normal) + spacing * (len(surfs_normal) - 1)
+    max_w = max(s.get_width() for s in surfs_normal) if surfs_normal else 0
+    return surfs_normal, surfs_hover, spacing, total_h, max_w
+
+def _fit_option_surfaces(labels):
+    start_size = max(30, int(HEIGHT * OVERLAY_OPTION_START_SIZE_FRAC))
+    font_size = start_size
+    while font_size > OVERLAY_OPTION_MIN_SIZE_PX:
+        surfs_normal, surfs_hover, spacing, total_h, max_w = _build_option_surfaces(labels, font_size)
+        if max_w <= int(WIDTH * OVERLAY_OPTIONS_MAX_WIDTH_FRAC) and total_h <= int(HEIGHT * OVERLAY_OPTIONS_MAX_HEIGHT_FRAC):
+            break
+        font_size -= 2
+    return surfs_normal, surfs_hover, spacing
+
+def build_overlay_cache(title_text: str, option_labels):
+    title_surf = render_text_styled(
+        font_overlay_title, title_text,
+        fill=MENU_HOVER_FILL,
+        outline=MENU_TEXT_OUTLINE,
+        outline_px=MENU_OUTLINE_PX,
+        shadow=MENU_TEXT_SHADOW,
+        shadow_offset=MENU_SHADOW_OFFSET
+    )
+    title_rect = title_surf.get_rect(center=(WIDTH // 2, int(HEIGHT * OVERLAY_TITLE_Y_FRAC)))
+
+    option_normal, option_hover, spacing = _fit_option_surfaces(option_labels)
+    option_rects = []
+    y = title_rect.bottom + int(HEIGHT * OVERLAY_OPTIONS_GAP_FRAC)
+    for surf in option_normal:
+        r = surf.get_rect(centerx=WIDTH // 2)
+        r.top = y
+        option_rects.append(r)
+        y += surf.get_height() + spacing
+
+    return {
+        "title_surf": title_surf,
+        "title_rect": title_rect,
+        "option_normal": option_normal,
+        "option_hover": option_hover,
+        "option_rects": option_rects,
+    }
+
+def draw_overlay_menu(dst: pygame.Surface, cache: dict, mouse_pos):
+    dst.blit(dim_overlay, (0, 0))
+    dst.blit(cache["title_surf"], cache["title_rect"].topleft)
+
+    mx, my = mouse_pos
+    hovered = -1
+    for i, rect in enumerate(cache["option_rects"]):
+        if rect.collidepoint(mx, my):
+            hovered = i
+        surf = cache["option_hover"][i] if i == hovered else cache["option_normal"][i]
+        dst.blit(surf, rect.topleft)
+
+    return hovered
+
+def draw_pause_button(dst: pygame.Surface, hovered: bool):
+    rect = pause_button_rect
+    cx, cy = rect.center
+    radius = rect.width // 2
+
+    fill = PAUSE_BTN_FILL_HOVER if hovered else PAUSE_BTN_FILL
+    pygame.draw.circle(dst, fill, (cx, cy), radius)
+    pygame.draw.circle(dst, PAUSE_BTN_OUTLINE, (cx, cy), radius, width=2)
+
+    bar_w = max(4, int(radius * 0.28))
+    bar_h = max(12, int(radius * 1.2))
+    gap = max(5, int(radius * 0.35))
+    bar_y = cy - bar_h // 2
+    left_x = cx - gap // 2 - bar_w
+    right_x = cx + gap // 2
+
+    pygame.draw.rect(
+        dst, PAUSE_BTN_ICON,
+        pygame.Rect(left_x, bar_y, bar_w, bar_h),
+        border_radius=max(1, bar_w // 2)
+    )
+    pygame.draw.rect(
+        dst, PAUSE_BTN_ICON,
+        pygame.Rect(right_x, bar_y, bar_w, bar_h),
+        border_radius=max(1, bar_w // 2)
+    )
+
+timer_cache_seconds = None
+timer_cache_surf = None
+
+def draw_bg_timer(dst: pygame.Surface, now_ms: int):
+    global timer_cache_seconds, timer_cache_surf
+    if not bg_timer_enabled:
+        return
+    if bg_switch_start_ms is None:
+        remaining_ms = BG_SWITCH_EVERY_MS
+    else:
+        remaining_ms = max(0, BG_SWITCH_EVERY_MS - (now_ms - bg_switch_start_ms))
+
+    seconds_left = int(math.ceil(remaining_ms / 1000.0))
+    if seconds_left != timer_cache_seconds or timer_cache_surf is None:
+        timer_cache_seconds = seconds_left
+        label = f"TLO ZA: {seconds_left}s"
+        timer_cache_surf = render_text_styled(
+            font_hud, label,
+            fill=MENU_TEXT_FILL,
+            outline=MENU_TEXT_OUTLINE,
+            outline_px=4,
+            shadow=MENU_TEXT_SHADOW,
+            shadow_offset=(3, 3)
+        )
+
+    dst.blit(timer_cache_surf, (HUD_MARGIN_PX, HUD_MARGIN_PX))
+
+def draw_game_world(dst: pygame.Surface):
+    bg_scroll_x = int(bg_scroll_num // PIX_DEN)
+    draw_scrolling_bg(dst, bg_sequence[bg_index], bg_scroll_x)
+    obstacles.draw(dst)
+    dx, dy = dino_draw_pos()
+    dst.blit(dino_img, (dx, dy))
+
+def capture_game_frame(now_ms: int, include_hud: bool = True) -> pygame.Surface:
+    frame = pygame.Surface((WIDTH, HEIGHT)).convert()
+    draw_game_world(frame)
+    if include_hud:
+        draw_bg_timer(frame, now_ms)
+        draw_pause_button(frame, hovered=False)
+    return frame
+
+def make_countdown_base_frame(bg_idx: int = 0) -> pygame.Surface:
+    frame = make_scrolling_bg_frame(bg_sequence[bg_idx], 0)
+    gy = get_ground_y_for_bg(bg_idx)
+    dx = int(dino_x - dino_img.get_width() // 2)
+    dy = int(gy - dino_img.get_height())
+    frame.blit(dino_img, (dx, dy))
+    return frame
+
+def resume_from_pause(now_ms: int):
+    global pause_started_ms, bg_switch_start_ms
+    if pause_started_ms is None:
+        return
+
+    pause_ms = max(0, now_ms - pause_started_ms)
+    if bg_switch_start_ms is not None:
+        bg_switch_start_ms += pause_ms
+
+    try:
+        obstacles.next_spawn_ms += pause_ms
+    except Exception:
+        pass
+
+    pause_started_ms = None
 
 def load_scale_cursor(path: str, win_h: int):
     raw = convert_img_alpha(load_raw(path))
@@ -539,12 +749,32 @@ pygame.display.set_icon(icon)
 FONT_PATH = "assets/fonts/Bangers-Regular.ttf"
 font_big = pygame.font.Font(FONT_PATH, 64)
 font_small = pygame.font.Font(FONT_PATH, 32)
+font_hud = pygame.font.Font(FONT_PATH, max(22, int(HEIGHT * 0.040)))
+font_overlay_title = pygame.font.Font(FONT_PATH, max(56, int(HEIGHT * 0.115)))
 
 # Fonts dla ustawień (ładniejsze skalowanie)
 font_set_title = pygame.font.Font(FONT_PATH, max(72, int(HEIGHT * 0.12)))
 font_set_h1 = pygame.font.Font(FONT_PATH, max(48, int(HEIGHT * 0.075)))
 font_set_label = pygame.font.Font(FONT_PATH, max(30, int(HEIGHT * 0.045)))
 font_set_hint = pygame.font.Font(FONT_PATH, max(22, int(HEIGHT * 0.032)))
+
+font_countdown = pygame.font.Font(FONT_PATH, max(140, int(HEIGHT * 0.35)))
+countdown_outline_px = max(6, int(font_countdown.get_height() * 0.08))
+countdown_shadow_offset = (
+    max(4, int(countdown_outline_px * 0.6)),
+    max(4, int(countdown_outline_px * 0.6)),
+)
+countdown_surfs = {
+    i: render_text_styled(
+        font_countdown, str(i),
+        fill=MENU_HOVER_FILL,
+        outline=MENU_TEXT_OUTLINE,
+        outline_px=countdown_outline_px,
+        shadow=MENU_TEXT_SHADOW,
+        shadow_offset=countdown_shadow_offset
+    )
+    for i in range(COUNTDOWN_SECONDS, 0, -1)
+}
 
 # =====================
 # GRAFIKI
@@ -785,20 +1015,44 @@ def compose_menu_frame(mouse_pos, dt_ms: int):
 
 load_surface = pygame.Surface((WIDTH, HEIGHT)).convert()
 load_surface.blit(load_level_bg, (0, 0))
+countdown_bg_frame = None
+
+# =====================
+# HUD / PAUSE / GAME OVER - INIT
+# =====================
+HUD_MARGIN_PX = max(10, int(HEIGHT * HUD_MARGIN_FRAC))
+pause_btn_radius = max(16, int(HEIGHT * PAUSE_BTN_RADIUS_FRAC))
+pause_button_rect = pygame.Rect(0, 0, pause_btn_radius * 2, pause_btn_radius * 2)
+pause_button_rect.topright = (WIDTH - HUD_MARGIN_PX, HUD_MARGIN_PX)
+
+dim_overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+dim_overlay.fill((0, 0, 0, OVERLAY_DIM_ALPHA))
+
+pause_menu_cache = build_overlay_cache(
+    "PAUZA",
+    ["KONTYNUUJ GRE", "ROZPOCZNIJ NOWA GRE", "WROC DO MENU"],
+)
+game_over_menu_cache = build_overlay_cache(
+    "PRZEGRALES",
+    ["ROZPOCZNIJ NOWA GRE", "WROC DO MENU"],
+)
 
 # =====================
 # USTAWIENIA - NOWY DESIGN
 # =====================
 
 # Globalny stan zakładek: 0 = Audio, 1 = Sterowanie
-settings_active_tab = 0  # 0: AUDIO, 1: STEROWANIE
+settings_active_tab = 0  # 0: AUDIO, 1: STEROWANIE, 2: OGOLNE
 
 # Recty interaktywne (updateowane w _build_settings_cache)
 settings_sidebar_audio_rect = pygame.Rect(0, 0, 0, 0)
 settings_sidebar_controls_rect = pygame.Rect(0, 0, 0, 0)
+settings_sidebar_general_rect = pygame.Rect(0, 0, 0, 0)
 
 settings_toggle_rect = pygame.Rect(0, 0, 0, 0)
 settings_sound_row_rect = pygame.Rect(0, 0, 0, 0)
+settings_timer_toggle_rect = pygame.Rect(0, 0, 0, 0)
+settings_timer_row_rect = pygame.Rect(0, 0, 0, 0)
 
 settings_control_btn_rects = [pygame.Rect(0, 0, 0, 0) for _ in range(3)]
 SET_CONTROL_OPTIONS = [
@@ -810,6 +1064,7 @@ settings_back_rect = pygame.Rect(0, 0, 0, 0)
 
 # Animacja suwaka audio
 toggle_anim = 1.0 if jump_sound_enabled else 0.0
+bg_timer_toggle_anim = 1.0 if bg_timer_enabled else 0.0
 
 # Cache elementów graficznych
 _settings_cache = {
@@ -821,13 +1076,19 @@ _settings_cache = {
     "tab_audio_unsel": None,  # Surface nieaktywnej zakładki Audio
     "tab_ctrl_sel": None,
     "tab_ctrl_unsel": None,
+    "tab_gen_sel": None,
+    "tab_gen_unsel": None,
 
     "hdr_audio": None,        # Tytuł sekcji (prawy panel)
     "hdr_ctrl": None,
+    "hdr_general": None,
 
     "sound_label": None,
     "sound_status_on": None,
     "sound_status_off": None,
+    "timer_label": None,
+    "timer_status_on": None,
+    "timer_status_off": None,
 
     "btn_text_sel": None,     # dict: key -> surface
     "btn_text_unsel": None,   # dict: key -> surface
@@ -841,8 +1102,8 @@ def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 def _build_settings_cache():
-    global settings_sidebar_audio_rect, settings_sidebar_controls_rect
-    global settings_toggle_rect, settings_sound_row_rect, settings_back_rect
+    global settings_sidebar_audio_rect, settings_sidebar_controls_rect, settings_sidebar_general_rect
+    global settings_toggle_rect, settings_sound_row_rect, settings_timer_toggle_rect, settings_timer_row_rect, settings_back_rect
     global settings_control_btn_rects
     global _settings_cache
 
@@ -886,15 +1147,18 @@ def _build_settings_cache():
     tab_h = int(sidebar_rect.height * 0.12)
     tab_gap = int(sidebar_rect.height * 0.02)
 
-    r_audio = pygame.Rect(
+    r_gen = pygame.Rect(
         sidebar_rect.left + int(sidebar_rect.width * 0.06),
         sidebar_rect.top + int(sidebar_rect.height * 0.18),
         int(sidebar_rect.width * 0.88),
         tab_h
     )
+    r_audio = r_gen.copy()
+    r_audio.top = r_gen.bottom + tab_gap
     r_ctrl = r_audio.copy()
     r_ctrl.top = r_audio.bottom + tab_gap
 
+    settings_sidebar_general_rect = r_gen
     settings_sidebar_audio_rect = r_audio
     settings_sidebar_controls_rect = r_ctrl
 
@@ -918,6 +1182,8 @@ def _build_settings_cache():
     tab_audio_unsel = make_tab_label("AUDIO", False)
     tab_ctrl_sel = make_tab_label("STEROWANIE", True)
     tab_ctrl_unsel = make_tab_label("STEROWANIE", False)
+    tab_gen_sel = make_tab_label("OGOLNE", True)
+    tab_gen_unsel = make_tab_label("OGOLNE", False)
 
     # --- MAIN CONTENT HEADERS ---
     def make_header(text):
@@ -931,6 +1197,8 @@ def _build_settings_cache():
         )
         return h1
 
+    hdr_general = make_header("USTAWIENIA OGOLNE")
+
     hdr_audio = make_header("USTAWIENIA DŹWIĘKU")
     hdr_ctrl = make_header("STEROWANIE POSTACIĄ")
 
@@ -940,21 +1208,33 @@ def _build_settings_cache():
     sound_label = font_set_label.render("DŹWIĘK SKOKU", True, SET_MUTED).convert_alpha()
 
     # Toggle Rect (mniejszy)
-    tog_w = int(main_rect.width * 0.40)
-    tog_h = int(main_rect.height * 0.070)
-    tog_w = max(240, tog_w)
-    tog_h = max(32, tog_h)
+    tog_w = int(main_rect.width * 0.34)
+    tog_h = int(main_rect.height * 0.055)
+    tog_w = max(210, tog_w)
+    tog_h = max(26, tog_h)
 
     tog = pygame.Rect(0, 0, tog_w, tog_h)
     tog.centerx = main_rect.centerx
-    tog.centery = main_rect.centery
+    tog.centery = main_rect.centery + int(main_rect.height * 0.05)
 
     settings_toggle_rect = tog
     # Cały wiersz dla hit boxa (opcjonalnie)
-    settings_sound_row_rect = tog.inflate(20, 20)
+    settings_sound_row_rect = tog.inflate(16, 16)
 
     sound_status_on = font_set_hint.render("WŁĄCZONY", True, SET_TOGGLE_ON).convert_alpha()
     sound_status_off = font_set_hint.render("WYŁĄCZONY", True, SET_TOGGLE_OFF).convert_alpha()
+
+    timer_label = font_set_label.render("ODLICZANIE DO NASTEPNEGO TLA", True, SET_MUTED).convert_alpha()
+
+    timer_tog = pygame.Rect(0, 0, tog_w, tog_h)
+    timer_tog.centerx = main_rect.centerx
+    timer_tog.centery = main_rect.centery + int(main_rect.height * 0.05)
+
+    settings_timer_toggle_rect = timer_tog
+    settings_timer_row_rect = timer_tog.inflate(16, 16)
+
+    timer_status_on = font_set_hint.render("WLACZONY", True, SET_TOGGLE_ON).convert_alpha()
+    timer_status_off = font_set_hint.render("WYLACZONY", True, SET_TOGGLE_OFF).convert_alpha()
 
     # --- CONTROLS ELEMENTS ---
     # Grupa przycisków
@@ -1001,13 +1281,19 @@ def _build_settings_cache():
         "tab_audio_unsel": tab_audio_unsel,
         "tab_ctrl_sel": tab_ctrl_sel,
         "tab_ctrl_unsel": tab_ctrl_unsel,
+        "tab_gen_sel": tab_gen_sel,
+        "tab_gen_unsel": tab_gen_unsel,
 
         "hdr_audio": hdr_audio,
         "hdr_ctrl": hdr_ctrl,
+        "hdr_general": hdr_general,
 
         "sound_label": sound_label,
         "sound_status_on": sound_status_on,
         "sound_status_off": sound_status_off,
+        "timer_label": timer_label,
+        "timer_status_on": timer_status_on,
+        "timer_status_off": timer_status_off,
 
         "btn_text_sel": btn_text_sel,
         "btn_text_unsel": btn_text_unsel,
@@ -1037,11 +1323,11 @@ def _draw_pretty_slider(dst: pygame.Surface, rect: pygame.Rect, t: float, hovere
     # Gałka
     cx = int(_lerp(rect.left + r, rect.right - r, t))
     cy = rect.centery
-    knob_r = int(rect.height * 0.48)
+    knob_r = max(6, int(rect.height * 0.42))
 
     # Glow gałki
     if hovered:
-        pygame.draw.circle(dst, (44, 220, 140, 60), (cx, cy), knob_r + 6)
+        pygame.draw.circle(dst, (44, 220, 140, 60), (cx, cy), knob_r + 5)
 
     # Cień
     pygame.draw.circle(dst, (0,0,0,80), (cx+2, cy+2), knob_r)
@@ -1080,7 +1366,7 @@ def _draw_sidebar_tab(dst: pygame.Surface, rect: pygame.Rect, label_surf: pygame
     dst.blit(label_surf, lr.topleft)
 
 def compose_settings_frame(mouse_pos, dt_ms: int):
-    global toggle_anim, jump_sound_enabled, jump_key_mode
+    global toggle_anim, jump_sound_enabled, jump_key_mode, bg_timer_toggle_anim, bg_timer_enabled
     global _settings_frame, _settings_just_entered
     global settings_active_tab
 
@@ -1098,8 +1384,16 @@ def compose_settings_frame(mouse_pos, dt_ms: int):
 
     # --- SIDEBAR LOGIC ---
     # Rysujemy przyciski zakładek
+    hov_gen = settings_sidebar_general_rect.collidepoint(mx, my)
     hov_audio = settings_sidebar_audio_rect.collidepoint(mx, my)
     hov_ctrl = settings_sidebar_controls_rect.collidepoint(mx, my)
+
+    # General Tab Button
+    _draw_sidebar_tab(
+        surf, settings_sidebar_general_rect,
+        _settings_cache["tab_gen_sel"] if settings_active_tab == 2 else _settings_cache["tab_gen_unsel"],
+        active=(settings_active_tab == 2), hovered=hov_gen
+    )
 
     # Audio Tab Button
     _draw_sidebar_tab(
@@ -1114,7 +1408,6 @@ def compose_settings_frame(mouse_pos, dt_ms: int):
         _settings_cache["tab_ctrl_sel"] if settings_active_tab == 1 else _settings_cache["tab_ctrl_unsel"],
         active=(settings_active_tab == 1), hovered=hov_ctrl
     )
-
     # --- MAIN CONTENT LOGIC ---
     if settings_active_tab == 0:
         # === AUDIO TAB ===
@@ -1126,10 +1419,12 @@ def compose_settings_frame(mouse_pos, dt_ms: int):
 
         # Content: Slider
         label = _settings_cache["sound_label"]
-        lr = label.get_rect(center=(main_rect.centerx, main_rect.centery - 44))
-        surf.blit(label, lr.topleft)
 
         tog = settings_toggle_rect
+        label_gap = max(18, int(main_rect.height * 0.06))
+        lr = label.get_rect(center=(main_rect.centerx, tog.top - label_gap))
+        surf.blit(label, lr.topleft)
+
         hov_tog = tog.collidepoint(mx, my)
 
         # Animacja suwaka
@@ -1145,10 +1440,11 @@ def compose_settings_frame(mouse_pos, dt_ms: int):
 
         # Status text
         st = _settings_cache["sound_status_on"] if jump_sound_enabled else _settings_cache["sound_status_off"]
-        sr = st.get_rect(center=(tog.centerx, tog.bottom + 25))
+        status_gap = max(16, int(main_rect.height * 0.05))
+        sr = st.get_rect(center=(tog.centerx, tog.bottom + status_gap))
         surf.blit(st, sr.topleft)
 
-    else:
+    elif settings_active_tab == 1:
         # === CONTROLS TAB ===
         # Header
         h = _settings_cache["hdr_ctrl"]
@@ -1167,6 +1463,41 @@ def compose_settings_frame(mouse_pos, dt_ms: int):
             txt = _settings_cache["btn_text_sel"][key] if sel else _settings_cache["btn_text_unsel"][key]
             tr = txt.get_rect(center=br.center)
             surf.blit(txt, tr.topleft)
+
+    else:
+        # === GENERAL TAB ===
+        # Header
+        h = _settings_cache["hdr_general"]
+        hr = h.get_rect(topleft=(main_rect.left + int(main_rect.width * 0.07), main_rect.top + int(main_rect.height * 0.08)))
+        surf.blit(h, hr.topleft)
+        draw_divider(surf, main_rect.left + 30, main_rect.right - 30, hr.bottom + 20)
+
+        # Content: Slider
+        label = _settings_cache["timer_label"]
+
+        tog = settings_timer_toggle_rect
+        label_gap = max(18, int(main_rect.height * 0.06))
+        lr = label.get_rect(center=(main_rect.centerx, tog.top - label_gap))
+        surf.blit(label, lr.topleft)
+
+        hov_tog = tog.collidepoint(mx, my)
+
+        # Animacja suwaka
+        target = 1.0 if bg_timer_enabled else 0.0
+        if _settings_just_entered:
+            bg_timer_toggle_anim = target
+        else:
+            step = clamp(dt_ms / 120.0, 0.0, 1.0)
+            bg_timer_toggle_anim = bg_timer_toggle_anim + (target - bg_timer_toggle_anim) * step
+
+        t = smoothstep(bg_timer_toggle_anim)
+        _draw_pretty_slider(surf, tog, t, hov_tog)
+
+        # Status text
+        st = _settings_cache["timer_status_on"] if bg_timer_enabled else _settings_cache["timer_status_off"]
+        status_gap = max(16, int(main_rect.height * 0.05))
+        sr = st.get_rect(center=(tog.centerx, tog.bottom + status_gap))
+        surf.blit(st, sr.topleft)
 
     if _settings_just_entered:
         _settings_just_entered = False
@@ -1191,6 +1522,13 @@ def start_fade(now_ms: int, from_surf: pygame.Surface, to_surf: pygame.Surface,
     fade_start_ms = now_ms
     fade_duration_ms = max(1, duration_ms)
     fade_next_state = next_state
+
+def begin_countdown(now_ms: int, from_surf: pygame.Surface):
+    global state, countdown_start_ms, countdown_bg_frame
+    countdown_start_ms = None
+    countdown_bg_frame = make_countdown_base_frame(0)
+    start_fade(now_ms, from_surf, countdown_bg_frame, FADE_BG_TO_COUNTDOWN_MS, STATE_COUNTDOWN)
+    state = STATE_FADE_BG_COUNTDOWN
 
 def draw_fade(now_ms: int):
     elapsed = now_ms - fade_start_ms
@@ -1220,12 +1558,18 @@ STATE_FADE_SETTINGS_MENU = "fade_settings_menu"
 STATE_FADE_MENU_LOAD = "fade_menu_load"
 STATE_LOAD = "load"
 STATE_FADE_LOAD_BG = "fade_load_bg"
+STATE_COUNTDOWN = "countdown"
 STATE_BG = "bg_cycle"
+STATE_PAUSED = "paused"
+STATE_GAME_OVER = "game_over"
+STATE_FADE_BG_COUNTDOWN = "fade_bg_countdown"
 STATE_FADE_BG_MENU = "fade_bg_menu"
 
 state = STATE_INTRO
 intro_start_ms = pygame.time.get_ticks()
 load_start_ms = None
+pause_started_ms = None
+countdown_start_ms = None
 
 menu_frame_surface = menu_surface_static
 menu_item_rects_dynamic = menu_item_rects_static
@@ -1293,6 +1637,40 @@ while running:
                     except Exception:
                         pass
 
+        if state == STATE_BG and event.type == pygame.KEYDOWN and event.key == pygame.K_p:
+            pause_started_ms = now
+            state = STATE_PAUSED
+
+        if state == STATE_BG and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if pause_button_rect.collidepoint(event.pos):
+                pause_started_ms = now
+                state = STATE_PAUSED
+
+        if state == STATE_PAUSED and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            mx, my = event.pos
+            if pause_menu_cache["option_rects"][0].collidepoint(mx, my):
+                resume_from_pause(now)
+                state = STATE_BG
+            elif pause_menu_cache["option_rects"][1].collidepoint(mx, my):
+                pause_started_ms = None
+                frame = capture_game_frame(now, include_hud=False)
+                begin_countdown(now, frame)
+            elif pause_menu_cache["option_rects"][2].collidepoint(mx, my):
+                pause_started_ms = None
+                frame = capture_game_frame(now, include_hud=False)
+                start_fade(now, frame, menu_surface_static, FADE_BG_TO_MENU_MS, STATE_MENU)
+                state = STATE_FADE_BG_MENU
+
+        if state == STATE_GAME_OVER and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            mx, my = event.pos
+            if game_over_menu_cache["option_rects"][0].collidepoint(mx, my):
+                frame = capture_game_frame(now, include_hud=False)
+                begin_countdown(now, frame)
+            elif game_over_menu_cache["option_rects"][1].collidepoint(mx, my):
+                frame = capture_game_frame(now, include_hud=False)
+                start_fade(now, frame, menu_surface_static, FADE_BG_TO_MENU_MS, STATE_MENU)
+                state = STATE_FADE_BG_MENU
+
         if state == STATE_MENU and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
 
@@ -1317,7 +1695,9 @@ while running:
             mx, my = event.pos
 
             # 1. Obsługa paska bocznego (zakładki)
-            if settings_sidebar_audio_rect.collidepoint(mx, my):
+            if settings_sidebar_general_rect.collidepoint(mx, my):
+                settings_active_tab = 2
+            elif settings_sidebar_audio_rect.collidepoint(mx, my):
                 settings_active_tab = 0
             elif settings_sidebar_controls_rect.collidepoint(mx, my):
                 settings_active_tab = 1
@@ -1338,6 +1718,12 @@ while running:
                         break
 
             # 3. Powrót (Hint na dole)
+            elif settings_active_tab == 2:
+                # GENERAL TAB - tylko suwak
+                if settings_timer_toggle_rect.collidepoint(mx, my) or settings_timer_row_rect.collidepoint(mx, my):
+                    bg_timer_enabled = not bg_timer_enabled
+                    save_user_settings()
+
             if settings_back_rect.collidepoint(mx, my):
                 save_user_settings()
                 from_s = settings_frame_surface
@@ -1383,6 +1769,25 @@ while running:
             first_bg_frame = make_scrolling_bg_frame(bg_sequence[0], 0)
             start_fade(now, load_surface, first_bg_frame, FADE_LOAD_TO_BG_MS, STATE_BG)
             state = STATE_FADE_LOAD_BG
+
+    elif state == STATE_COUNTDOWN:
+        if countdown_start_ms is None:
+            countdown_start_ms = now
+        if countdown_bg_frame is None:
+            countdown_bg_frame = make_countdown_base_frame(0)
+        if now - countdown_start_ms >= COUNTDOWN_DURATION_MS:
+            speed_mult = 1.0
+            apply_speed_to_systems(rescale_existing=False)
+
+            bg_index = 0
+            bg_switch_start_ms = now
+            bg_scroll_num = 0
+            snap_dino_to_ground(bg_index)
+
+            obstacles.reset(bg_index, now, dino_safe_right_px=dino_safe_right_px(), start_visible=True)
+
+            countdown_start_ms = None
+            state = STATE_BG
 
     elif state == STATE_BG:
         if bg_switch_start_ms is None:
@@ -1440,14 +1845,7 @@ while running:
             dino_hit_rect=dino_hit,
             min_overlap_pixels=MIN_OVERLAP_PIXELS
         ):
-            bg_scroll_x = int(bg_scroll_num // PIX_DEN)
-            frame = pygame.Surface((WIDTH, HEIGHT)).convert()
-            draw_scrolling_bg(frame, bg_sequence[bg_index], bg_scroll_x)
-            obstacles.draw(frame)
-            frame.blit(dino_img, (dx, dy))
-
-            start_fade(now, frame, menu_surface_static, FADE_BG_TO_MENU_MS, STATE_MENU)
-            state = STATE_FADE_BG_MENU
+            state = STATE_GAME_OVER
 
     # =====================
     # RYSOWANIE
@@ -1467,12 +1865,39 @@ while running:
         settings_frame_surface = compose_settings_frame(pygame.mouse.get_pos(), dt)
         screen.blit(settings_frame_surface, (0, 0))
 
+    elif state == STATE_COUNTDOWN:
+        set_hand_cursor(False)
+        if countdown_bg_frame is None:
+            countdown_bg_frame = make_countdown_base_frame(0)
+        screen.blit(countdown_bg_frame, (0, 0))
+        if countdown_start_ms is None:
+            seconds_left = COUNTDOWN_SECONDS
+        else:
+            elapsed_ms = max(0, now - countdown_start_ms)
+            seconds_left = COUNTDOWN_SECONDS - (elapsed_ms // 1000)
+            seconds_left = max(1, min(COUNTDOWN_SECONDS, int(seconds_left)))
+        surf = countdown_surfs.get(int(seconds_left))
+        if surf is not None:
+            rect = surf.get_rect(center=(WIDTH // 2, HEIGHT // 2))
+            screen.blit(surf, rect.topleft)
+
+    elif state == STATE_PAUSED:
+        set_hand_cursor(False)
+        draw_game_world(screen)
+        draw_overlay_menu(screen, pause_menu_cache, pygame.mouse.get_pos())
+
+    elif state == STATE_GAME_OVER:
+        set_hand_cursor(False)
+        draw_game_world(screen)
+        draw_overlay_menu(screen, game_over_menu_cache, pygame.mouse.get_pos())
+
     elif state in (
         STATE_FADE_INTRO_MENU,
         STATE_FADE_MENU_LOAD,
         STATE_FADE_MENU_SETTINGS,
         STATE_FADE_SETTINGS_MENU,
         STATE_FADE_LOAD_BG,
+        STATE_FADE_BG_COUNTDOWN,
         STATE_FADE_BG_MENU,
     ):
         set_hand_cursor(False)
@@ -1483,6 +1908,8 @@ while running:
                 load_start_ms = now
             if state == STATE_SETTINGS:
                 _settings_just_entered = True
+            if state == STATE_COUNTDOWN:
+                countdown_start_ms = now
             if state == STATE_BG:
                 bg_switch_start_ms = now
                 bg_scroll_num = 0
@@ -1503,13 +1930,10 @@ while running:
 
     elif state == STATE_BG:
         set_hand_cursor(False)
-        bg_scroll_x = int(bg_scroll_num // PIX_DEN)
-        draw_scrolling_bg(screen, bg_sequence[bg_index], bg_scroll_x)
-
-        obstacles.draw(screen)
-
-        dx, dy = dino_draw_pos()
-        screen.blit(dino_img, (dx, dy))
+        draw_game_world(screen)
+        draw_bg_timer(screen, now)
+        pause_hovered = pause_button_rect.collidepoint(pygame.mouse.get_pos())
+        draw_pause_button(screen, hovered=pause_hovered)
 
     # =====================
     # RYSUJ WŁASNY KURSOR NA WIERZCHU
@@ -1525,3 +1949,5 @@ while running:
 save_user_settings()
 pygame.quit()
 sys.exit()
+
+
