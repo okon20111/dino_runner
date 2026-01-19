@@ -264,7 +264,7 @@ class ObstacleManager:
     def _load_raw_bank(self) -> Dict[int, List[pygame.Surface]]:
         bank: Dict[int, List[pygame.Surface]] = {}
         path_bank: Dict[int, List[str]] = {}
-        for i in range(6):
+        for i in range(8):
             pat = os.path.join(self.obstacle_dir, f"bg{i+1}_*.png")
             paths = sorted(glob.glob(pat))
             imgs: List[pygame.Surface] = []

@@ -19,7 +19,7 @@ pygame.init()
 
 # Lepsza jakość skalowania (jeśli backend dostępny)
 try:
-    pygame.transform.set_smoothscale_backend("SSE")
+    pygame.transform.set_smoothscale_backend("SSE2")
 except Exception:
     try:
         pygame.transform.set_smoothscale_backend("GENERIC")
@@ -48,6 +48,8 @@ FADE_MENU_TO_SETTINGS_MS = 650
 FADE_SETTINGS_TO_MENU_MS = 450
 
 TARGET_FPS_NO_VSYNC = 90
+ESC_EXIT_PRESS_COUNT = 3
+ESC_EXIT_PRESS_WINDOW_MS = 1200
 
 # =====================
 # WŁASNY KURSOR (skalowany)
@@ -90,6 +92,8 @@ GROUND_Y_FRAC_BY_BG = [
     0.86,  # bg4
     0.90,  # bg5
     0.86,  # bg6
+    0.86,  # bg7
+    0.906, # bg8
 ]
 
 GROUND_Y_PX_OFFSET_BY_BG = [
@@ -99,6 +103,8 @@ GROUND_Y_PX_OFFSET_BY_BG = [
     +5,     # bg4
     -16,    # bg5
     0,      # bg6
+    0,      # bg7
+    0,      # bg8
 ]
 
 DINO_X_FRAC = 0.18
@@ -342,6 +348,32 @@ def get_work_area_rect():
     info = pygame.display.Info()
     return 0, 0, info.current_w, info.current_h
 
+def _set_window_position_win32(x: int, y: int) -> bool:
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+        hwnd = pygame.display.get_wm_info().get("window")
+        if not hwnd:
+            return False
+        SWP_NOSIZE = 0x0001
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, None, int(x), int(y), 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+        )
+        return True
+    except Exception:
+        return False
+
+def _set_window_position_safe(x: int, y: int) -> bool:
+    try:
+        pygame.display.set_window_position(int(x), int(y))
+        return True
+    except Exception:
+        return _set_window_position_win32(x, y)
+
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -465,6 +497,49 @@ def draw_overlay_menu(dst: pygame.Surface, cache: dict, mouse_pos):
 
     return hovered
 
+def draw_overlay_menu_animated(dst: pygame.Surface, cache: dict, mouse_pos, dt_ms: int, hover_t):
+    dst.blit(dim_overlay, (0, 0))
+    dst.blit(cache["title_surf"], cache["title_rect"].topleft)
+
+    mx, my = mouse_pos
+    hovered = -1
+    for i, rect in enumerate(cache["option_rects"]):
+        if rect.collidepoint(mx, my):
+            hovered = i
+            break
+
+    step = dt_ms / max(1, MENU_HOVER_ANIM_MS)
+    for i in range(len(hover_t)):
+        if i == hovered:
+            hover_t[i] = min(1.0, hover_t[i] + step)
+        else:
+            hover_t[i] = max(0.0, hover_t[i] - step)
+
+    for i in range(len(cache["option_rects"])):
+        t = smoothstep(hover_t[i])
+        scale = 1.0 + MENU_HOVER_SCALE * t
+        rise = int(MENU_HOVER_RISE_PX * t)
+
+        n0 = cache["option_normal"][i]
+        h0 = cache["option_hover"][i]
+
+        nw = max(1, int(n0.get_width() * scale))
+        nh = max(1, int(n0.get_height() * scale))
+
+        n = pygame.transform.smoothscale(n0, (nw, nh))
+        h = pygame.transform.smoothscale(h0, (nw, nh))
+
+        n.set_alpha(int(255 * (1.0 - t)))
+        h.set_alpha(int(255 * t))
+
+        cx, cy = cache["option_rects"][i].center
+        r = n.get_rect(center=(cx, cy - rise))
+
+        dst.blit(n, r.topleft)
+        dst.blit(h, r.topleft)
+
+    return hovered
+
 def draw_pause_button(dst: pygame.Surface, hovered: bool):
     rect = pause_button_rect
     cx, cy = rect.center
@@ -557,6 +632,60 @@ def resume_from_pause(now_ms: int):
         pass
 
     pause_started_ms = None
+
+def reset_exit_confirm_presses():
+    global esc_exit_press_count, esc_exit_last_press_ms
+    esc_exit_press_count = 0
+    esc_exit_last_press_ms = None
+
+def register_exit_confirm_press(now_ms: int) -> bool:
+    global esc_exit_press_count, esc_exit_last_press_ms
+    if esc_exit_last_press_ms is None or now_ms - esc_exit_last_press_ms > ESC_EXIT_PRESS_WINDOW_MS:
+        esc_exit_press_count = 1
+    else:
+        esc_exit_press_count += 1
+    esc_exit_last_press_ms = now_ms
+    if esc_exit_press_count >= ESC_EXIT_PRESS_COUNT:
+        reset_exit_confirm_presses()
+        return True
+    return False
+
+def enter_exit_confirm(now_ms: int):
+    global state, exit_confirm_prev_state, exit_confirm_frame, exit_confirm_started_ms
+    if state == STATE_EXIT_CONFIRM:
+        return
+    exit_confirm_prev_state = state
+    exit_confirm_frame = screen.copy()
+    exit_confirm_started_ms = now_ms
+    state = STATE_EXIT_CONFIRM
+
+def resume_from_exit_confirm(now_ms: int):
+    global state, exit_confirm_prev_state, exit_confirm_frame, exit_confirm_started_ms
+    global fade_start_ms, load_start_ms, countdown_start_ms, intro_start_ms
+    if exit_confirm_prev_state is None:
+        state = STATE_MENU
+        exit_confirm_started_ms = None
+        return
+
+    pause_ms = max(0, now_ms - (exit_confirm_started_ms or now_ms))
+    prev_state = exit_confirm_prev_state
+
+    if prev_state.startswith("fade_"):
+        fade_start_ms += pause_ms
+    elif prev_state == STATE_INTRO:
+        intro_start_ms += pause_ms
+    elif prev_state == STATE_LOAD:
+        if load_start_ms is not None:
+            load_start_ms += pause_ms
+    elif prev_state == STATE_COUNTDOWN:
+        if countdown_start_ms is not None:
+            countdown_start_ms += pause_ms
+
+    state = prev_state
+    exit_confirm_prev_state = None
+    exit_confirm_started_ms = None
+    exit_confirm_frame = None
+    reset_exit_confirm_presses()
 
 def load_scale_cursor(path: str, win_h: int):
     raw = convert_img_alpha(load_raw(path))
@@ -720,22 +849,10 @@ target_y = clamp(target_y, top, bottom - HEIGHT)
 
 fixed_pos = None
 
-try:
-    pygame.display.set_window_position(target_x, target_y)
+if _set_window_position_safe(target_x, target_y):
     fixed_pos = (target_x, target_y)
-except Exception:
+else:
     fixed_pos = None
-
-sdl_window = None
-if fixed_pos is None:
-    try:
-        import pygame._sdl2 as sdl2
-        sdl_window = sdl2.Window.from_display_module()
-        sdl_window.position = (target_x, target_y)
-        fixed_pos = (target_x, target_y)
-    except Exception:
-        sdl_window = None
-        fixed_pos = None
 
 # =====================
 # IKONA
@@ -789,8 +906,10 @@ bg3 = scale_to_window(load_raw("assets/game_bg/bg3.png"), WIDTH, HEIGHT)
 bg4 = scale_to_window(load_raw("assets/game_bg/bg4.png"), WIDTH, HEIGHT)
 bg5 = scale_to_window(load_raw("assets/game_bg/bg5.png"), WIDTH, HEIGHT)
 bg6 = scale_to_window(load_raw("assets/game_bg/bg6.png"), WIDTH, HEIGHT)
+bg7 = scale_to_window(load_raw("assets/game_bg/bg7.png"), WIDTH, HEIGHT)
+bg8 = scale_to_window(load_raw("assets/game_bg/bg8.png"), WIDTH, HEIGHT)
 
-bg_sequence = [bg1, bg2, bg3, bg4, bg5, bg6]
+bg_sequence = [bg1, bg2, bg3, bg4, bg5, bg6, bg7, bg8]
 
 # =====================
 # WŁASNY KURSOR
@@ -822,6 +941,9 @@ dino_bounds = union_rects(dino_bounds_list) or dino_img.get_rect()
 DINO_BOTTOM_PAD_PX = int(dino_img.get_height() - dino_bounds.bottom)
 if DINO_BOTTOM_PAD_PX < 0:
     DINO_BOTTOM_PAD_PX = 0
+if len(GROUND_Y_PX_OFFSET_BY_BG) > 7:
+    # bg8: push ground down to match the white base using dino bottom padding
+    GROUND_Y_PX_OFFSET_BY_BG[7] += DINO_BOTTOM_PAD_PX
 
 dino_x = int(WIDTH * 0.18)
 dino_y = 0.0
@@ -1032,9 +1154,15 @@ pause_menu_cache = build_overlay_cache(
     "PAUZA",
     ["KONTYNUUJ GRE", "ROZPOCZNIJ NOWA GRE", "WROC DO MENU"],
 )
+pause_menu_hover_t = [0.0 for _ in pause_menu_cache["option_rects"]]
 game_over_menu_cache = build_overlay_cache(
     "PRZEGRALES",
     ["ROZPOCZNIJ NOWA GRE", "WROC DO MENU"],
+)
+game_over_hover_t = [0.0 for _ in game_over_menu_cache["option_rects"]]
+exit_confirm_cache = build_overlay_cache(
+    "CZY NA PEWNO WYJSC?",
+    ["WYJDZ", "ZOSTAN"],
 )
 
 # =====================
@@ -1042,7 +1170,7 @@ game_over_menu_cache = build_overlay_cache(
 # =====================
 
 # Globalny stan zakładek: 0 = Audio, 1 = Sterowanie
-settings_active_tab = 0  # 0: AUDIO, 1: STEROWANIE, 2: OGOLNE
+settings_active_tab = 2  # 0: AUDIO, 1: STEROWANIE, 2: OGOLNE
 
 # Recty interaktywne (updateowane w _build_settings_cache)
 settings_sidebar_audio_rect = pygame.Rect(0, 0, 0, 0)
@@ -1266,7 +1394,7 @@ def _build_settings_cache():
         btn_text_unsel[key] = font_set_hint.render(label, True, (220, 220, 235)).convert_alpha()
 
     # --- BOTTOM HINT ---
-    hint = font_set_hint.render("ESC - POWRÓT", True, (220, 220, 235)).convert_alpha()
+    hint = font_set_hint.render("WROC DO MENU", True, (220, 220, 235)).convert_alpha()
     hint_pos = (int(WIDTH * 0.06), int(HEIGHT * 0.93))
     base.blit(hint, hint_pos)
     hint_rect = pygame.Rect(hint_pos[0], hint_pos[1], hint.get_width(), hint.get_height())
@@ -1562,6 +1690,7 @@ STATE_COUNTDOWN = "countdown"
 STATE_BG = "bg_cycle"
 STATE_PAUSED = "paused"
 STATE_GAME_OVER = "game_over"
+STATE_EXIT_CONFIRM = "exit_confirm"
 STATE_FADE_BG_COUNTDOWN = "fade_bg_countdown"
 STATE_FADE_BG_MENU = "fade_bg_menu"
 
@@ -1570,6 +1699,11 @@ intro_start_ms = pygame.time.get_ticks()
 load_start_ms = None
 pause_started_ms = None
 countdown_start_ms = None
+exit_confirm_prev_state = None
+exit_confirm_frame = None
+exit_confirm_started_ms = None
+esc_exit_press_count = 0
+esc_exit_last_press_ms = None
 
 menu_frame_surface = menu_surface_static
 menu_item_rects_dynamic = menu_item_rects_static
@@ -1582,7 +1716,7 @@ def set_hand_cursor(is_hand: bool):
     return
 
 # =====================
-# BG (bg1->bg6) - zmienne stanu
+# BG (bg1->bg8) - zmienne stanu
 # =====================
 bg_index = 0
 bg_switch_start_ms = None
@@ -1608,10 +1742,15 @@ while running:
             save_user_settings()
             running = False
 
-        # ESC: w ustawieniach -> powrót (zapis + fade), wszędzie indziej jak było (wyjście)
+        # ESC: w grze pauza, poza gra 3x aby pokazac wyjscie
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            if state == STATE_SETTINGS:
-                # zapisz i ładnie wróć do menu
+            if state == STATE_BG:
+                reset_exit_confirm_presses()
+                pause_started_ms = now
+                state = STATE_PAUSED
+                pause_menu_hover_t = [0.0 for _ in pause_menu_cache["option_rects"]]
+            elif state == STATE_SETTINGS:
+                reset_exit_confirm_presses()
                 save_user_settings()
                 from_s = settings_frame_surface
                 if from_s is None:
@@ -1620,12 +1759,13 @@ while running:
                 start_fade(now, from_s, menu_surface_static, FADE_SETTINGS_TO_MENU_MS, STATE_MENU)
                 state = STATE_FADE_SETTINGS_MENU
             elif state in (STATE_FADE_MENU_SETTINGS, STATE_FADE_SETTINGS_MENU):
-                # w trakcie przejścia ignorujemy ESC
+                reset_exit_confirm_presses()
                 pass
+            elif state == STATE_EXIT_CONFIRM:
+                resume_from_exit_confirm(now)
             else:
-                # przy zamykaniu gry też utrwalamy ustawienia
-                save_user_settings()
-                running = False
+                if register_exit_confirm_press(now):
+                    enter_exit_confirm(now)
 
         if state == STATE_BG and event.type == pygame.KEYDOWN and event.key == current_jump_key():
             if dino_on_ground:
@@ -1640,11 +1780,13 @@ while running:
         if state == STATE_BG and event.type == pygame.KEYDOWN and event.key == pygame.K_p:
             pause_started_ms = now
             state = STATE_PAUSED
+            pause_menu_hover_t = [0.0 for _ in pause_menu_cache["option_rects"]]
 
         if state == STATE_BG and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if pause_button_rect.collidepoint(event.pos):
                 pause_started_ms = now
                 state = STATE_PAUSED
+                pause_menu_hover_t = [0.0 for _ in pause_menu_cache["option_rects"]]
 
         if state == STATE_PAUSED and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
@@ -1671,6 +1813,15 @@ while running:
                 start_fade(now, frame, menu_surface_static, FADE_BG_TO_MENU_MS, STATE_MENU)
                 state = STATE_FADE_BG_MENU
 
+        if state == STATE_EXIT_CONFIRM and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            mx, my = event.pos
+            if exit_confirm_cache["option_rects"][0].collidepoint(mx, my):
+                save_user_settings()
+                running = False
+            elif exit_confirm_cache["option_rects"][1].collidepoint(mx, my):
+                resume_from_exit_confirm(now)
+            continue
+
         if state == STATE_MENU and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
 
@@ -1686,7 +1837,7 @@ while running:
             elif menu_item_rects_dynamic[1].collidepoint(mx, my):
                 # >>> ładne przejście do ustawień
                 _settings_just_entered = True
-                settings_active_tab = 0 # reset na Audio
+                settings_active_tab = 2 # reset na Ogolne
                 preview = compose_settings_frame(pygame.mouse.get_pos(), dt)
                 start_fade(now, menu_frame_surface, preview, FADE_MENU_TO_SETTINGS_MS, STATE_SETTINGS)
                 state = STATE_FADE_MENU_SETTINGS
@@ -1738,11 +1889,7 @@ while running:
             if pygame.display.get_window_position() != fixed_pos:
                 pygame.display.set_window_position(*fixed_pos)
         except Exception:
-            try:
-                if sdl_window is not None and sdl_window.position != fixed_pos:
-                    sdl_window.position = fixed_pos
-            except Exception:
-                pass
+            _set_window_position_win32(*fixed_pos)
 
     # =====================
     # LOGIKA STANÓW
@@ -1846,6 +1993,7 @@ while running:
             min_overlap_pixels=MIN_OVERLAP_PIXELS
         ):
             state = STATE_GAME_OVER
+            game_over_hover_t = [0.0 for _ in game_over_menu_cache["option_rects"]]
 
     # =====================
     # RYSOWANIE
@@ -1884,12 +2032,20 @@ while running:
     elif state == STATE_PAUSED:
         set_hand_cursor(False)
         draw_game_world(screen)
-        draw_overlay_menu(screen, pause_menu_cache, pygame.mouse.get_pos())
+        draw_overlay_menu_animated(screen, pause_menu_cache, pygame.mouse.get_pos(), dt, pause_menu_hover_t)
 
     elif state == STATE_GAME_OVER:
         set_hand_cursor(False)
         draw_game_world(screen)
-        draw_overlay_menu(screen, game_over_menu_cache, pygame.mouse.get_pos())
+        draw_overlay_menu_animated(screen, game_over_menu_cache, pygame.mouse.get_pos(), dt, game_over_hover_t)
+
+    elif state == STATE_EXIT_CONFIRM:
+        set_hand_cursor(False)
+        if exit_confirm_frame is not None:
+            screen.blit(exit_confirm_frame, (0, 0))
+        else:
+            screen.fill((0, 0, 0))
+        draw_overlay_menu(screen, exit_confirm_cache, pygame.mouse.get_pos())
 
     elif state in (
         STATE_FADE_INTRO_MENU,
@@ -1949,5 +2105,3 @@ while running:
 save_user_settings()
 pygame.quit()
 sys.exit()
-
-
